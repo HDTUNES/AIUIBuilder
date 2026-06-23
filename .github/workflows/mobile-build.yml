@@ -342,8 +342,16 @@ jobs:
                   }
               }
           
-              common_sampler_free(sampler); // fresh grammar sampler per generation, then free
-              return env->NewStringUTF(output.c_str());
+    common_sampler_free(sampler); // fresh grammar sampler per generation, then free
+
+    // Return as real UTF-8 bytes, not NewStringUTF(modified UTF-8), because token pieces
+    // can contain arbitrary UTF-8 and NewStringUTF can crash on invalid modified UTF-8.
+    jbyteArray bytes = env->NewByteArray((jsize) output.size());
+    env->SetByteArrayRegion(bytes, 0, (jsize) output.size(), reinterpret_cast<const jbyte *>(output.data()));
+    jclass string_cls = env->FindClass("java/lang/String");
+    jmethodID ctor = env->GetMethodID(string_cls, "<init>", "([BLjava/lang/String;)V");
+    jstring utf8 = env->NewStringUTF("UTF-8");
+    return (jstring) env->NewObject(string_cls, ctor, bytes, utf8);
           }
           
           extern "C"
