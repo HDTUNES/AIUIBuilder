@@ -352,6 +352,157 @@ jobs:
         with:
           gradle-version: 8.9
 
+      - name: Force-create valid llamaLib Android module
+        shell: bash
+        run: |
+          echo "Forcing local llamaLib module so Gradle creates Android variants..."
+          mkdir -p llamaLib/src/main/cpp llamaLib/src/main/java llamaLib/src/main
+
+          cat > settings.gradle.kts <<'SETTINGS'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "AIUIBuilder"
+          include(":app")
+          include(":llamaLib")
+          SETTINGS
+
+          cat > build.gradle.kts <<'ROOTGRADLE'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("com.android.library") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+              id("org.jetbrains.kotlin.plugin.serialization") version "2.0.21" apply false
+          }
+          ROOTGRADLE
+
+          cat > llamaLib/build.gradle.kts <<'LIBGRADLE'
+          plugins {
+              id("com.android.library")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.arm.aichat"
+              compileSdk = 35
+              ndkVersion = "29.0.13113456"
+
+              defaultConfig {
+                  minSdk = 26
+                  consumerProguardFiles("consumer-rules.pro")
+                  ndk { abiFilters += listOf("arm64-v8a") }
+                  externalNativeBuild {
+                      cmake {
+                          arguments += "-DCMAKE_BUILD_TYPE=Release"
+                          arguments += "-DBUILD_SHARED_LIBS=ON"
+                          arguments += "-DLLAMA_BUILD_APP=OFF"
+                          arguments += "-DLLAMA_BUILD_COMMON=ON"
+                          arguments += "-DLLAMA_OPENSSL=OFF"
+                          arguments += "-DGGML_NATIVE=OFF"
+                          arguments += "-DGGML_BACKEND_DL=ON"
+                          arguments += "-DGGML_CPU_ALL_VARIANTS=ON"
+                          arguments += "-DGGML_LLAMAFILE=OFF"
+                      }
+                  }
+                  aarMetadata { minCompileSdk = 35 }
+              }
+
+              externalNativeBuild {
+                  cmake {
+                      path("src/main/cpp/CMakeLists.txt")
+                      version = "3.31.6"
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              packaging { resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" } }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.15.0")
+              implementation("androidx.datastore:datastore-preferences:1.1.1")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+          }
+          LIBGRADLE
+
+          cat > llamaLib/src/main/AndroidManifest.xml <<'MANIFEST'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android" />
+          MANIFEST
+
+          cat > llamaLib/consumer-rules.pro <<'PRO'
+          -keep class com.arm.aichat.** { *; }
+          PRO
+          cat > llamaLib/proguard-rules.pro <<'PRO'
+          -keep class com.arm.aichat.** { *; }
+          PRO
+
+          cat > llamaLib/src/main/cpp/CMakeLists.txt <<'CMAKE'
+          cmake_minimum_required(VERSION 3.31.6)
+          project("ai-chat" VERSION 1.0.0 LANGUAGES C CXX)
+          set(CMAKE_C_STANDARD 11)
+          set(CMAKE_C_STANDARD_REQUIRED true)
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED true)
+
+          if(DEFINED ANDROID_ABI)
+              message(STATUS "Detected Android ABI: ${ANDROID_ABI}")
+              if(ANDROID_ABI STREQUAL "arm64-v8a")
+                  set(GGML_SYSTEM_ARCH "ARM")
+                  set(GGML_CPU_KLEIDIAI ON)
+                  set(GGML_OPENMP ON)
+              else()
+                  message(FATAL_ERROR "Unsupported ABI: ${ANDROID_ABI}")
+              endif()
+          endif()
+
+          set(LLAMA_SRC ${CMAKE_CURRENT_LIST_DIR}/../../../../external/llama.cpp)
+          if(NOT EXISTS ${LLAMA_SRC}/CMakeLists.txt)
+              message(FATAL_ERROR "llama.cpp not found at ${LLAMA_SRC}")
+          endif()
+          add_subdirectory(${LLAMA_SRC} build-llama)
+          add_library(${CMAKE_PROJECT_NAME} SHARED ai_chat.cpp)
+          target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
+              GGML_SYSTEM_ARCH=${GGML_SYSTEM_ARCH}
+              GGML_CPU_KLEIDIAI=$<BOOL:${GGML_CPU_KLEIDIAI}>
+              GGML_OPENMP=$<BOOL:${GGML_OPENMP}>
+          )
+          target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
+              ${LLAMA_SRC}
+              ${LLAMA_SRC}/common
+              ${LLAMA_SRC}/include
+              ${LLAMA_SRC}/ggml/include
+              ${LLAMA_SRC}/ggml/src
+          )
+          target_link_libraries(${CMAKE_PROJECT_NAME} llama llama-common android log)
+          CMAKE
+
+          if [ ! -d external/llama.cpp ]; then
+            mkdir -p external
+            git clone --depth 1 https://github.com/ggml-org/llama.cpp external/llama.cpp
+          fi
+          cp external/llama.cpp/examples/llama.android/lib/src/main/cpp/ai_chat.cpp llamaLib/src/main/cpp/ai_chat.cpp
+          cp external/llama.cpp/examples/llama.android/lib/src/main/cpp/logging.h llamaLib/src/main/cpp/logging.h
+          cp -R external/llama.cpp/examples/llama.android/lib/src/main/java/* llamaLib/src/main/java/
+
+          echo "VERIFY llamaLib files:"
+          ls -la llamaLib
+          find llamaLib -maxdepth 3 -type f | sort
+
       - name: Build debug APK
         shell: bash
         run: gradle assembleDebug --stacktrace
