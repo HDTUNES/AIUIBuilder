@@ -118,6 +118,247 @@ jobs:
           print('Patched ai_chat.cpp tuning successfully')
           PY
 
+          # Add strict recursive refiner native JNI bridge.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('llamaLib/src/main/cpp/ai_chat.cpp')
+          s = p.read_text()
+          if '#include \"json-schema-to-grammar.h\"' not in s:
+              s = s.replace('#include \"llama.h\"', '#include \"llama.h\"\n#include \"json-schema-to-grammar.h\"\n#include <nlohmann/json.hpp>', 1)
+          p.write_text(s)
+          PY
+
+          cat >> llamaLib/src/main/cpp/ai_chat.cpp <<'CPP'
+          
+          // -----------------------------------------------------------------------------
+          // Strict Recursive Refiner JNI bridge
+          // Requirements:
+          // - grounding evaluated once and kept in llama.cpp memory/KV cache
+          // - each iteration removes positions [grounding_end, inf) via llama_memory_seq_rm
+          // - grammar OFF while evaluating instruction/directive prompt
+          // - fresh native GBNF grammar sampler ON during JSON generation
+          // - flat two-field JSON schema only: refined, next_focus
+          // -----------------------------------------------------------------------------
+          
+          static llama_pos rr_grounding_end = 0;
+          static llama_pos rr_current_position = 0;
+          static bool rr_started = false;
+          
+          static const char * RR_JSON_SCHEMA = R"JSON({
+            "type": "object",
+            "properties": {
+              "refined": { "type": "string" },
+              "next_focus": { "type": "string" }
+            },
+            "required": ["refined", "next_focus"],
+            "additionalProperties": false
+          })JSON";
+          
+          static bool rr_json_complete(const std::string & text) {
+              int depth = 0;
+              bool in_string = false;
+              bool escape_next = false;
+              bool seen_object = false;
+          
+              for (char ch : text) {
+                  if (escape_next) {
+                      escape_next = false;
+                      continue;
+                  }
+                  if (ch == '\\' && in_string) {
+                      escape_next = true;
+                      continue;
+                  }
+                  if (ch == '"') {
+                      in_string = !in_string;
+                      continue;
+                  }
+                  if (in_string) continue;
+                  if (ch == '{') {
+                      depth++;
+                      seen_object = true;
+                  } else if (ch == '}') {
+                      depth--;
+                      if (seen_object && depth == 0) return true;
+                  }
+              }
+              return false;
+          }
+          
+          static int rr_decode_tokens(const llama_tokens & tokens, bool compute_last_logit) {
+              if (!g_context || tokens.empty()) return 0;
+              const int n_ctx = (int) llama_n_ctx(g_context);
+              int batch_cap = g_batch_size;
+              if (batch_cap <= 0) batch_cap = 256;
+          
+              for (int i = 0; i < (int) tokens.size(); i += batch_cap) {
+                  const int cur = std::min((int) tokens.size() - i, batch_cap);
+                  if (rr_current_position + cur >= n_ctx - 4) {
+                      LOGe("rr_decode_tokens: context overflow: pos=%d cur=%d n_ctx=%d", (int) rr_current_position, cur, n_ctx);
+                      return 2;
+                  }
+                  common_batch_clear(g_batch);
+                  for (int j = 0; j < cur; ++j) {
+                      const bool want_logit = compute_last_logit && (i + j == (int) tokens.size() - 1);
+                      common_batch_add(g_batch, tokens[i + j], rr_current_position + j, {0}, want_logit);
+                  }
+                  if (llama_decode(g_context, g_batch) != 0) {
+                      LOGe("rr_decode_tokens: llama_decode failed");
+                      return 1;
+                  }
+                  rr_current_position += cur;
+              }
+              return 0;
+          }
+          
+          extern "C"
+          JNIEXPORT jint JNICALL
+          Java_com_arena_aiuibuilder_NativeRecursiveRefiner_beginSession(JNIEnv * env, jclass, jstring jgrounding) {
+              if (!g_model || !g_context) {
+                  env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), "Model/context is not loaded");
+                  return 1;
+              }
+          
+              const char * grounding_chars = env->GetStringUTFChars(jgrounding, nullptr);
+              std::string grounding(grounding_chars ? grounding_chars : "");
+              env->ReleaseStringUTFChars(jgrounding, grounding_chars);
+          
+              if (grounding.empty()) {
+                  env->ThrowNew(env->FindClass("java/lang/IllegalArgumentException"), "Grounding cannot be empty");
+                  return 2;
+              }
+          
+              // Full clear only at session start. Requirement: grounding is evaluated once after this.
+              llama_memory_clear(llama_get_memory(g_context), false);
+              rr_grounding_end = 0;
+              rr_current_position = 0;
+              rr_started = false;
+          
+              // Grounding input evaluation: grammar OFF.
+              llama_tokens tokens = common_tokenize(g_context, grounding, true, true);
+              int rc = rr_decode_tokens(tokens, false);
+              if (rc != 0) {
+                  env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), "Failed to evaluate grounding");
+                  return rc;
+              }
+          
+              rr_grounding_end = rr_current_position;
+              rr_started = true;
+              LOGi("Recursive refiner grounding cached through position %d", (int) rr_grounding_end);
+              return 0;
+          }
+          
+          extern "C"
+          JNIEXPORT jstring JNICALL
+          Java_com_arena_aiuibuilder_NativeRecursiveRefiner_refineOnce(
+              JNIEnv * env,
+              jclass,
+              jstring jprompt,
+              jint jmax_tokens,
+              jfloat jtemperature,
+              jint jtop_k,
+              jfloat jtop_p,
+              jfloat jmin_p,
+              jfloat jrepeat_penalty
+          ) {
+              if (!rr_started || !g_model || !g_context) {
+                  env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), "Recursive refiner session not started");
+                  return env->NewStringUTF("");
+              }
+          
+              const char * prompt_chars = env->GetStringUTFChars(jprompt, nullptr);
+              std::string prompt(prompt_chars ? prompt_chars : "");
+              env->ReleaseStringUTFChars(jprompt, prompt_chars);
+          
+              // Strict KV cache erasure: remove only tokens after grounding boundary.
+              // Current llama.cpp API equivalent of llama_kv_cache_seq_rm(ctx, 0, grounding_end, -1).
+              if (!llama_memory_seq_rm(llama_get_memory(g_context), 0, rr_grounding_end, -1)) {
+                  env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), "llama_memory_seq_rm failed");
+                  return env->NewStringUTF("");
+              }
+              rr_current_position = rr_grounding_end; // strict position reset after cache erase
+          
+              // Instruction/directive evaluation: grammar OFF.
+              llama_tokens prompt_tokens = common_tokenize(g_context, prompt, false, true);
+              int rc = rr_decode_tokens(prompt_tokens, true);
+              if (rc != 0) {
+                  env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), "Failed to evaluate recursive prompt");
+                  return env->NewStringUTF("");
+              }
+          
+              // Compile JSON schema -> GBNF grammar fresh per generation.
+              std::string grammar_str;
+              try {
+                  grammar_str = json_schema_to_grammar(nlohmann::ordered_json::parse(RR_JSON_SCHEMA));
+              } catch (...) {
+                  env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), "Failed to compile JSON schema to GBNF grammar");
+                  return env->NewStringUTF("");
+              }
+          
+              common_params_sampling sparams;
+              sparams.temp = (float) jtemperature;
+              sparams.top_k = (int32_t) jtop_k;
+              sparams.top_p = (float) jtop_p;
+              sparams.min_p = (float) jmin_p;
+              sparams.penalty_repeat = (float) jrepeat_penalty;
+              sparams.grammar = common_grammar(COMMON_GRAMMAR_TYPE_USER, grammar_str);
+          
+              common_sampler * sampler = nullptr;
+              try {
+                  sampler = common_sampler_init(g_model, sparams);
+              } catch (...) {
+                  env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), "Failed to initialize grammar sampler");
+                  return env->NewStringUTF("");
+              }
+          
+              std::string output;
+              std::string cached_utf8;
+              const int max_tokens = std::max(1, (int) jmax_tokens);
+              const llama_vocab * vocab = llama_model_get_vocab(g_model);
+          
+              for (int i = 0; i < max_tokens; ++i) {
+                  // grammar_first=true: invalid JSON tokens are removed before normal sampling.
+                  llama_token token = common_sampler_sample(sampler, g_context, -1, true);
+                  common_sampler_accept(sampler, token, true);
+          
+                  if (llama_vocab_is_eog(vocab, token)) {
+                      break;
+                  }
+          
+                  std::string piece = common_token_to_piece(g_context, token);
+                  output += piece;
+          
+                  common_batch_clear(g_batch);
+                  common_batch_add(g_batch, token, rr_current_position, {0}, true);
+                  if (llama_decode(g_context, g_batch) != 0) {
+                      common_sampler_free(sampler);
+                      env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), "llama_decode failed during recursive JSON generation");
+                      return env->NewStringUTF("");
+                  }
+                  rr_current_position++;
+          
+                  if (rr_json_complete(output)) {
+                      break;
+                  }
+              }
+          
+              common_sampler_free(sampler); // fresh grammar sampler per generation, then free
+              return env->NewStringUTF(output.c_str());
+          }
+          
+          extern "C"
+          JNIEXPORT void JNICALL
+          Java_com_arena_aiuibuilder_NativeRecursiveRefiner_resetSession(JNIEnv *, jclass) {
+              rr_started = false;
+              rr_grounding_end = 0;
+              rr_current_position = 0;
+              if (g_context) {
+                  llama_memory_clear(llama_get_memory(g_context), false);
+              }
+          }
+          CPP
+          grep -q 'NativeRecursiveRefiner_refineOnce' llamaLib/src/main/cpp/ai_chat.cpp
+
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
@@ -143,5 +384,5 @@ jobs:
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AIUIBuilder-Dark-Builder-Stable-Rotate-GGUF-debug-apk
+          name: AIUIBuilder-Recursive-Refiner-GGUF-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
