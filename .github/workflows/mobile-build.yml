@@ -330,6 +330,9 @@ jobs:
           git clone --depth 1 https://github.com/ggml-org/llama.cpp external/llama.cpp
           cp external/llama.cpp/examples/llama.android/lib/src/main/cpp/ai_chat.cpp llamaLib/src/main/cpp/ai_chat.cpp
           cp external/llama.cpp/examples/llama.android/lib/src/main/cpp/logging.h llamaLib/src/main/cpp/logging.h
+          # Fix: __android_log_is_loggable requires Android API 30, but this app supports API 26+.
+          # For this prototype we keep logging simple and always allow logs at/above the header level.
+          sed -i 's/return __android_log_is_loggable(prio, LOG_TAG, LOG_MIN_LEVEL);/return prio >= LOG_MIN_LEVEL;/' llamaLib/src/main/cpp/logging.h
           mkdir -p llamaLib/src/main/java
           cp -R external/llama.cpp/examples/llama.android/lib/src/main/java/* llamaLib/src/main/java/
 
@@ -497,6 +500,9 @@ jobs:
           fi
           cp external/llama.cpp/examples/llama.android/lib/src/main/cpp/ai_chat.cpp llamaLib/src/main/cpp/ai_chat.cpp
           cp external/llama.cpp/examples/llama.android/lib/src/main/cpp/logging.h llamaLib/src/main/cpp/logging.h
+          # Fix: __android_log_is_loggable requires Android API 30, but this app supports API 26+.
+          # For this prototype we keep logging simple and always allow logs at/above the header level.
+          sed -i 's/return __android_log_is_loggable(prio, LOG_TAG, LOG_MIN_LEVEL);/return prio >= LOG_MIN_LEVEL;/' llamaLib/src/main/cpp/logging.h
           cp -R external/llama.cpp/examples/llama.android/lib/src/main/java/* llamaLib/src/main/java/
 
           echo "VERIFY llamaLib files:"
